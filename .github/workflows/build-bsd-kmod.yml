@@ -24,8 +24,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 qemu-utils sshpass expect \
-            mtools dosfstools genisoimage xorriso libguestfs-tools
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils expect \
+            mtools dosfstools genisoimage xorriso
 
       - name: Download image
         id: download
@@ -42,7 +42,6 @@ jobs:
         run: |
           FILENAME="${{ steps.download.outputs.filename }}"
 
-          # Decompress .xz
           if [[ "$FILENAME" == *.xz ]]; then
             echo "=== Decompressing xz ==="
             xz -d "$FILENAME" && FILENAME="${FILENAME%.xz}"
@@ -55,58 +54,37 @@ jobs:
           if [[ "$FILENAME" == *.qcow2 ]] || [[ "$FT" == *"QEMU QCOW"* ]]; then
             echo "image_type=qcow2" >> $GITHUB_OUTPUT
             mv "$FILENAME" disk.qcow2
-            echo "Detected QCOW2 VM image — will boot directly"
           elif [[ "$FILENAME" == *.img ]] || [[ "$FT" == *"DOS/MBR boot sector"* ]]; then
             echo "image_type=qcow2" >> $GITHUB_OUTPUT
             qemu-img convert -f raw -O qcow2 "$FILENAME" disk.qcow2
             rm -f "$FILENAME"
-            echo "Detected raw disk image — converted to QCOW2"
           elif [[ "$FILENAME" == *.iso ]] || [[ "$FT" == *"ISO 9660"* ]]; then
             echo "image_type=iso" >> $GITHUB_OUTPUT
             mv "$FILENAME" freebsd.iso
-            echo "Detected ISO — will install from ISO"
           else
-            echo "Unknown image type!"
-            exit 1
+            echo "Unknown image type!"; exit 1
           fi
           ls -lh disk.qcow2 2>/dev/null || true
 
-      - name: Prepare SSH key
-        run: |
-          ssh-keygen -t rsa -f id_rsa -N '' -q
-          mkdir -p ~/.ssh
-          echo "SSH key ready"
-
-      # ───── ISO path ─────
-      - name: Create installerconfig (ISO path)
+      # ───── ISO path: install FreeBSD ─────
+      - name: Create installerconfig
         if: steps.detect.outputs.image_type == 'iso'
         run: |
           F=installerconfig
           echo '#!/bin/sh' > $F
           echo 'set -ex' >> $F
           echo 'exec 1>/dev/tty 2>/dev/tty' >> $F
-          echo 'ROOTPW=ventoy' >> $F
           echo 'kbdcontrol -L /usr/share/syscons/keymaps/us.kbd' >> $F
           echo 'DISK=$(sysctl -n kern.disks | tr " " "\n" | grep -v -e "^cd" -e "^da" -e "^fd" | head -1)' >> $F
-          echo 'echo "Installing to disk: $DISK"' >> $F
           echo 'bsdinstall autopart ZFS $DISK' >> $F
           echo 'bsdinstall mount /mnt' >> $F
           echo 'bsdinstall distfetch /usr/freebsd-dist' >> $F
           echo 'bsdinstall distextract /mnt' >> $F
-          echo 'mkdir -p /mnt/root/.ssh' >> $F
-          echo 'cat > /mnt/root/.ssh/authorized_keys << EOF' >> $F
-          cat id_rsa.pub >> $F
-          echo 'EOF' >> $F
-          echo 'chmod 700 /mnt/root/.ssh' >> $F
-          echo 'chmod 600 /mnt/root/.ssh/authorized_keys' >> $F
-          echo 'cat >> /mnt/etc/rc.conf << EOF2' >> $F
+          echo 'cat >> /mnt/etc/rc.conf << EOF' >> $F
           echo 'hostname="ventoy-builder"' >> $F
           echo 'ifconfig_vtnet0="DHCP"' >> $F
           echo 'sshd_enable="YES"' >> $F
-          echo 'EOF2' >> $F
-          echo 'sed -i "" "s/^#PermitRootLogin.*/PermitRootLogin yes/" /mnt/etc/ssh/sshd_config' >> $F
-          echo 'echo "$ROOTPW" | pw -R /mnt usermod root -h 0' >> $F
-          echo 'cp /usr/share/zoneinfo/UTC /mnt/etc/localtime' >> $F
+          echo 'EOF' >> $F
           echo 'echo "autoboot_delay=\"0\"" >> /mnt/boot/loader.conf' >> $F
           echo 'bsdinstall umount /mnt' >> $F
           echo 'zfs umount -a 2>/dev/null || true' >> $F
@@ -125,195 +103,130 @@ jobs:
             -c boot.catalog -V "FREEBSD_AUTO" \
             -o freebsd_auto.iso iso_orig/ 2>&1 | tail -5
           ls -lh freebsd_auto.iso
-
-      - name: Create disk (ISO path)
-        if: steps.detect.outputs.image_type == 'iso'
-        run: qemu-img create -f qcow2 disk.qcow2 12G
+          qemu-img create -f qcow2 disk.qcow2 12G
 
       - name: Install FreeBSD from ISO
         if: steps.detect.outputs.image_type == 'iso'
         run: |
           KVM=",accel=kvm"
-          if [ ! -e /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
-            KVM=",accel=tcg"
-            echo "KVM not available, will be slow"
-          fi
-          echo "Installing FreeBSD from ISO (may take 5-15 min) ..."
+          [ ! -e /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ] && KVM=",accel=tcg"
+          echo "Installing (may take 5-15 min) ..."
           timeout 900 qemu-system-x86_64 \
             -machine pc-q35-4.2${KVM} -m 4096 \
             -cdrom freebsd_auto.iso \
             -drive file=disk.qcow2,format=qcow2,if=virtio \
             -nic user,model=virtio-net-pci \
             -nographic -no-reboot 2>&1 | tee install.log || true
-          tail -10 install.log
-          # Verify disk has data
-          qemu-img info disk.qcow2
+          tail -5 install.log
 
-      # ───── QCOW2 path ─────
-      - name: Inject SSH key into VM image (QCOW2 path)
-        if: steps.detect.outputs.image_type == 'qcow2'
+      # ───── Data disk with Ventoy source + build script ─────
+      - name: Create data disk with Ventoy source and build script
         run: |
-          echo "Injecting SSH key into VM image (best-effort)..."
-          {
-            echo 'mkdir-p /root/.ssh'
-            echo "write-append /root/.ssh/authorized_keys \"$(cat id_rsa.pub)\""
-            echo 'chmod 700 /root/.ssh'
-            echo 'chmod 600 /root/.ssh/authorized_keys'
-          } | guestfish -a disk.qcow2 -i 2>/dev/null && \
-            echo "guestfish: SSH key injected" || \
-            echo "guestfish failed (likely ZFS) — will use password auth"
+          dd if=/dev/zero of=data.raw bs=1M count=100
+          mkfs.msdos -F 32 data.raw
 
-      # ───── Common boot + build ─────
-      - name: Inject SSH key via serial console, then boot and build
+          # Copy Ventoy source for all versions
+          mmd -i data.raw ::/ventoy_src
+          for d in Unix/ventoy_unix_src/FreeBSD/geom_ventoy_src/*/; do
+            ver=$(basename "$d")
+            mmd -i data.raw "::/ventoy_src/$ver"
+            for f in "$d"sys/geom/ventoy/* "$d"sys/modules/geom/geom_ventoy/Makefile; do
+              [ -f "$f" ] && mcopy -i data.raw "$f" "::/ventoy_src/$ver/"
+            done
+          done
+
+          # Write build.sh (handles everything: source download + build)
+          cat > build.sh << 'BSHEOF'
+#!/bin/sh
+set -ex
+KVER=$(uname -r)
+VV=$(echo $KVER | cut -d. -f1)x
+echo "Kernel: $KVER  Version: $VV"
+
+# Ensure kernel source exists
+if [ ! -d /usr/src/sys ]; then
+  dhclient vtnet0
+  echo 'nameserver 8.8.8.8' > /etc/resolv.conf
+  R=$(uname -r)
+  fetch "http://download.freebsd.org/releases/amd64/$R/src.txz" -o /tmp/src.txz 2>/dev/null || \
+  fetch "http://download.freebsd.org/snapshots/amd64/$R/src.txz" -o /tmp/src.txz
+  cd / && tar xJf /tmp/src.txz
+fi
+
+# Copy Ventoy source
+cp -r /mnt/ventoy_src /tmp/
+VS=/tmp/ventoy_src/$VV
+test -d $VS || { echo "No source for $VV"; ls /tmp/ventoy_src/; exit 1; }
+cp -r $VS/sys/geom/ventoy /usr/src/sys/geom/ventoy 2>/dev/null || true
+mkdir -p /usr/src/sys/modules/geom/geom_ventoy
+cp $VS/Makefile /usr/src/sys/modules/geom/geom_ventoy/ 2>/dev/null || true
+
+# Build
+cd /usr/src/sys/modules/geom/geom_ventoy
+make -j$(sysctl -n hw.ncpu)
+
+# Copy result
+cp geom_ventoy.ko /mnt/
+xz -zf /mnt/geom_ventoy.ko
+echo "BUILD_DONE"
+BSHEOF
+          mcopy -i data.raw build.sh ::/build.sh
+          mdir -i data.raw ::
+          qemu-img convert -f raw -O qcow2 data.raw data.qcow2
+          ls -lh data.qcow2
+
+      # ───── Build via serial console ─────
+      - name: Build kernel module inside VM (serial console)
         id: build
         run: |
           KVM=",accel=kvm"
-          if [ ! -e /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
-            KVM=",accel=tcg"
-            echo "KVM not available, using TCG (slower)"
-          fi
+          [ ! -e /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ] && KVM=",accel=tcg"
 
-          PUBKEY=$(cat id_rsa.pub)
-          SCRIPT=serial_fix.exp
-          cat > $SCRIPT << EOS
-set timeout 120
-spawn qemu-system-x86_64 -machine pc-q35-4.2${KVM} -m 4096 -drive file=disk.qcow2,format=qcow2,if=virtio -nographic -no-reboot
-expect {
-  "Autoboot in" { send " "; exp_continue }
-  "OK" { }
-  timeout { exit 1 }
-}
-send "boot -s\\r"
-expect {
-  "#" { }
-  timeout { exit 1 }
-}
-send "mount -uw /\\r"
+          cat > run.exp << 'EXPEOF'
+set timeout 900
+set kvm [lindex $argv 0]
+
+spawn qemu-system-x86_64 -machine pc-q35-4.2$kvm -m 4096 \
+  -drive file=disk.qcow2,format=qcow2,if=virtio \
+  -drive file=data.qcow2,format=qcow2,if=virtio \
+  -nic user,model=virtio-net-pci \
+  -nographic -no-reboot
+
+# Boot menu -> single-user
+expect { "Autoboot in" { send " "; exp_continue } "OK" { } timeout { exit 1 } }
+send "boot -s\r"
+expect { "#" { } timeout { exit 1 } }
+
+# Mount root rw and data disk
+send "mount -uw /\r"
 expect "#"
-send "mkdir -p /root/.ssh\\r"
+send "for d in nda1 vtbd1 nvd1 da0; do mount -t msdosfs /dev/\$d /mnt 2>/dev/null && echo DISK=\$d && break; done\r"
 expect "#"
-send {cat > /root/.ssh/authorized_keys << 'EOF'}
-send "\\r"
-send "$PUBKEY"
-send "\\r"
-send "EOF\\r"
-expect "#"
-send "chmod 700 /root/.ssh\\r"
-expect "#"
-send "chmod 600 /root/.ssh/authorized_keys\\r"
-expect "#"
-send {echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config}
-send "\\r"
-expect "#"
-send {echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config}
-send "\\r"
-expect "#"
-send "sync; shutdown -p now\\r"
+
+# Build
+send "sh /mnt/build.sh\r"
+expect "BUILD_DONE" { } timeout { exit 1 }
+
+send "sync; poweroff\r"
 expect eof
-EOS
-          expect $SCRIPT 2>&1 || echo "Serial fix exit: $?"
+EXPEOF
 
-          # ── Boot with SSH forwarding ──
-          qemu-system-x86_64 \
-            -machine pc-q35-4.2${KVM} -m 4096 \
-            -drive file=disk.qcow2,format=qcow2,if=virtio \
-            -nic user,model=virtio-net-pci,hostfwd=tcp::10022-:22 \
-            -display none -no-reboot -pidfile vm.pid -daemonize
+          expect run.exp "$KVM"
+          echo "Build exit: $?"
 
-          # ── Wait for SSH ──
-          SSH_CMD=""
-          for i in $(seq 1 120); do
-            if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-              -i id_rsa root@localhost -p 10022 true 2>/dev/null; then
-              SSH_CMD="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_rsa root@localhost -p 10022"
-              echo "SSH ready after ${i}s"
-              break
-            fi
-            if [ $i -eq 120 ]; then
-              echo "SSH timeout"
-              kill $(cat vm.pid 2>/dev/null) 2>/dev/null || true
-              exit 1
-            fi
-            sleep 2
-          done
-
-          # Detect version
-          echo "=== VM system ==="
-          KVER=$($SSH_CMD uname -r)
-          echo "Kernel: $KVER"
-
-          case "$KVER" in
-            15.*) VV="15.x" ;;
-            14.*) VV="14.x" ;;
-            13.*) VV="13.x" ;;
-            12.*) VV="12.x" ;;
-            11.*) VV="11.x" ;;
-            10.*) VV="10.x" ;;
-            9.*)  VV="9.x"  ;;
-            *) echo "Unknown kernel: $KVER"; VV="" ;;
-          esac
-          echo "ventoy_version=$VV" >> $GITHUB_OUTPUT
-
-          # Copy Ventoy source
-          $SSH_CMD mkdir -p /ventoy
-          rsync -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_rsa -p 10022" \
-            -a --rsync-path=/usr/bin/rsync \
-            Unix/ root@localhost:/ventoy/Unix/ 2>/dev/null || \
-          rsync -e "sshpass -p freebsd ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 10022" \
-            -a --rsync-path=/usr/bin/rsync \
-            Unix/ root@localhost:/ventoy/Unix/ || \
-          rsync -e "sshpass -p '' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 10022" \
-            -a --rsync-path=/usr/bin/rsync \
-            Unix/ root@localhost:/ventoy/Unix/
-
-          # Install kernel source and build
-          $SSH_CMD "
-            set -ex
-
-            # Install kernel source
-            if [ -f /usr/freebsd-dist/src.txz ]; then
-              cd / && tar xJf /usr/freebsd-dist/src.txz
-              echo 'Source from ISO'
-            elif ! pkg install -y src 2>/dev/null; then
-              VER=\$(uname -r | sed 's/-.*//')
-              fetch \"https://download.freebsd.org/releases/amd64/\${VER}-RELEASE/src.txz\" \
-                -o /tmp/src.txz
-              cd / && tar xJf /tmp/src.txz
-              echo 'Source downloaded'
-            fi
-
-            # Build
-            VS=/ventoy/Unix/ventoy_unix_src/FreeBSD/geom_ventoy_src/$VV
-            if [ ! -d \"\$VS\" ]; then
-              echo \"No source for $VV\"
-              ls /ventoy/Unix/ventoy_unix_src/FreeBSD/geom_ventoy_src/
-              exit 1
-            fi
-            cp -r \"\$VS/sys/geom/ventoy\" /usr/src/sys/geom/ventoy
-            mkdir -p /usr/src/sys/modules/geom/geom_ventoy
-            cp \"\$VS/sys/modules/geom/geom_ventoy/Makefile\" /usr/src/sys/modules/geom/geom_ventoy/
-            cd /usr/src/sys/modules/geom/geom_ventoy
-            make -j\$(sysctl -n hw.ncpu)
-            file geom_ventoy.ko
-            xz -zf geom_ventoy.ko
-          "
-
-          # Copy artifact out
-          mkdir -p "Unix/ventoy_unix/FreeBSD/geom_ventoy_ko/$VV/64"
-          $SSH_CMD cat /usr/src/sys/modules/geom/geom_ventoy/geom_ventoy.ko.xz \
-            > "Unix/ventoy_unix/FreeBSD/geom_ventoy_ko/$VV/64/geom_ventoy.ko.xz"
-          ls -la "Unix/ventoy_unix/FreeBSD/geom_ventoy_ko/$VV/64/"
-
-          # Shutdown
-          $SSH_CMD shutdown -p now 2>/dev/null || true
-          sleep 3
-          kill $(cat vm.pid) 2>/dev/null || true
+      # ───── Extract artifact ─────
+      - name: Extract .ko from data disk
+        run: |
+          mdir -i data.raw ::/ 2>/dev/null | grep geom_ventoy || true
+          mcopy -i data.raw ::/geom_ventoy.ko.xz . 2>/dev/null || \
+          mcopy -i data.raw ::/geom_ventoy.ko.xz ./geom_ventoy.ko.xz 2>/dev/null || true
+          ls -lh geom_ventoy.ko.xz 2>/dev/null || echo "No .ko found"
 
       - name: Upload KMOD artifact
         uses: actions/upload-artifact@v4
         with:
-          name: geom_ventoy-${{ steps.build.outputs.ventoy_version }}-64.ko.xz
-          path: Unix/ventoy_unix/FreeBSD/geom_ventoy_ko/${{ steps.build.outputs.ventoy_version }}/64/geom_ventoy.ko.xz
+          name: geom_ventoy-64.ko.xz
+          path: geom_ventoy.ko.xz
 
   build-ventoy:
     needs: [build-kmod]
@@ -324,7 +237,6 @@ EOS
       - name: Download built KMOD
         uses: actions/download-artifact@v4
         with:
-          name: geom_ventoy-${{ needs.build-kmod.outputs.ventoy_version }}-64.ko.xz
-          path: Unix/ventoy_unix/FreeBSD/geom_ventoy_ko/${{ needs.build-kmod.outputs.ventoy_version }}/64/
+          name: geom_ventoy-64.ko.xz
       - name: Build Ventoy
         run: docker compose up
