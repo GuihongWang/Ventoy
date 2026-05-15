@@ -24,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 qemu-utils sshpass mtools dosfstools
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils sshpass mtools dosfstools genisoimage
 
       - name: Download ISO
         run: |
@@ -44,9 +44,11 @@ jobs:
           echo '#!/bin/sh' > $F
           echo 'set -ex' >> $F
           echo 'exec 1>/dev/tty 2>/dev/tty' >> $F
-          echo 'DISK=da0' >> $F
           echo 'ROOTPW=ventoy' >> $F
           echo 'kbdcontrol -L /usr/share/syscons/keymaps/us.kbd' >> $F
+          # Detect main disk (skip cd0, da0=USB config, fd0)
+          echo 'DISK=$(sysctl -n kern.disks | tr " " "\n" | grep -v -e "^cd" -e "^da0$" -e "^fd" | head -1)' >> $F
+          echo 'echo "Installing to disk: $DISK"' >> $F
           echo 'bsdinstall autopart ZFS $DISK' >> $F
           echo 'bsdinstall mount /mnt' >> $F
           echo 'bsdinstall distfetch /usr/freebsd-dist' >> $F
@@ -85,6 +87,7 @@ jobs:
             -machine pc-q35-4.2${KVM} \
             -m 4096 \
             -cdrom freebsd.iso \
+            -device qemu-xhci,id=xhci \
             -drive file=config.img,format=raw,if=none,id=config \
             -device usb-storage,drive=config \
             -drive file=disk.qcow2,format=qcow2,if=virtio \
