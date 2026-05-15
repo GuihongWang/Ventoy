@@ -40,40 +40,31 @@ jobs:
 
       - name: Create automated install config
         run: |
-          python3 << 'PYEOF'
-import os, textwrap
-os.makedirs('config', exist_ok=True)
-config = r'''#!/bin/sh
-set -ex
-exec 1>/dev/tty 2>/dev/tty
-
-DISK=da0
-ROOTPW=ventoy
-
-kbdcontrol -L /usr/share/syscons/keymaps/us.kbd
-bsdinstall autopart ZFS $DISK
-bsdinstall mount /mnt
-bsdinstall distfetch /usr/freebsd-dist
-bsdinstall distextract /mnt
-
-cat >> /mnt/etc/rc.conf << EOF
-hostname="ventoy-builder"
-ifconfig_vtnet0="DHCP"
-sshd_enable="YES"
-EOF
-sed -i '' 's/^#PermitRootLogin.*/PermitRootLogin yes/' /mnt/etc/ssh/sshd_config
-echo "$ROOTPW" | pw -R /mnt usermod root -h 0
-cp /usr/share/zoneinfo/UTC /mnt/etc/localtime
-echo 'autoboot_delay="0"' >> /mnt/boot/loader.conf
-bsdinstall umount /mnt
-zfs umount -a 2>/dev/null || true
-poweroff
-'''
-with open('config/installerconfig', 'w') as f:
-    f.write(config)
-os.chmod('config/installerconfig', 0o755)
-print("installerconfig created")
-PYEOF
+          mkdir -p config
+          F=config/installerconfig
+          echo '#!/bin/sh' > $F
+          echo 'set -ex' >> $F
+          echo 'exec 1>/dev/tty 2>/dev/tty' >> $F
+          echo 'DISK=da0' >> $F
+          echo 'ROOTPW=ventoy' >> $F
+          echo 'kbdcontrol -L /usr/share/syscons/keymaps/us.kbd' >> $F
+          echo 'bsdinstall autopart ZFS $DISK' >> $F
+          echo 'bsdinstall mount /mnt' >> $F
+          echo 'bsdinstall distfetch /usr/freebsd-dist' >> $F
+          echo 'bsdinstall distextract /mnt' >> $F
+          printf '%s\n' 'cat >> /mnt/etc/rc.conf << EOF' >> $F
+          echo 'hostname="ventoy-builder"' >> $F
+          echo 'ifconfig_vtnet0="DHCP"' >> $F
+          echo 'sshd_enable="YES"' >> $F
+          echo 'EOF' >> $F
+          printf '%s\n' "sed -i '' 's/^#PermitRootLogin.*/PermitRootLogin yes/' /mnt/etc/ssh/sshd_config" >> $F
+          echo 'echo "$ROOTPW" | pw -R /mnt usermod root -h 0' >> $F
+          echo 'cp /usr/share/zoneinfo/UTC /mnt/etc/localtime' >> $F
+          echo 'echo '\''autoboot_delay="0"'\'' >> /mnt/boot/loader.conf' >> $F
+          echo 'bsdinstall umount /mnt' >> $F
+          echo 'zfs umount -a 2>/dev/null || true' >> $F
+          echo 'poweroff' >> $F
+          chmod +x $F
           genisoimage -R -o config.iso config/
           ls -lh config.iso
 
