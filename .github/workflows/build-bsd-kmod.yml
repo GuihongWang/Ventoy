@@ -4,20 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       freebsd_image_url:
-        description: 'BSD ISO or VM image URL (.iso / .qcow2 / .qcow2.xz)'
+        description: BSD ISO or VM image URL (.iso / .qcow2 / .qcow2.xz)
         required: true
         type: string
       build_ventoy:
-        description: 'Build full Ventoy package after KMOD build'
+        description: Build full Ventoy package after KMOD build
         type: boolean
         default: true
 
 jobs:
   build-kmod:
     runs-on: ubuntu-latest
-    outputs:
-      ventoy_version: ${{ steps.build.outputs.ventoy_version }}
-
     steps:
       - uses: actions/checkout@v4
 
@@ -66,9 +63,9 @@ jobs:
           fi
           ls -lh disk.qcow2 2>/dev/null || true
 
-      # ───── ISO path: install FreeBSD ─────
+      # ISO path: install FreeBSD
       - name: Create installerconfig
-        if: steps.detect.outputs.image_type == 'iso'
+        if: ${{ steps.detect.outputs.image_type == 'iso' }}
         run: |
           F=installerconfig
           echo '#!/bin/sh' > $F
@@ -92,7 +89,7 @@ jobs:
           chmod +x $F
 
       - name: Embed installerconfig into ISO
-        if: steps.detect.outputs.image_type == 'iso'
+        if: ${{ steps.detect.outputs.image_type == 'iso' }}
         run: |
           mkdir -p iso_orig
           xorriso -osirrox on -indev freebsd.iso -extract / iso_orig/ 2>/dev/null
@@ -106,7 +103,7 @@ jobs:
           qemu-img create -f qcow2 disk.qcow2 12G
 
       - name: Install FreeBSD from ISO
-        if: steps.detect.outputs.image_type == 'iso'
+        if: ${{ steps.detect.outputs.image_type == 'iso' }}
         run: |
           KVM=",accel=kvm"
           [ ! -e /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ] && KVM=",accel=tcg"
@@ -119,102 +116,79 @@ jobs:
             -nographic -no-reboot 2>&1 | tee install.log || true
           tail -5 install.log
 
-      # ───── Data disk with Ventoy source (tar) + build script ─────
-      - name: Create data disk with Ventoy source and build script
+      # Data disk with Ventoy source + build script
+      - name: Create data disk
         run: |
           dd if=/dev/zero of=data.raw bs=1M count=100
           mkfs.msdos -F 32 data.raw
-
-          # Tar each version's source tree preserving directory structure
           for d in Unix/ventoy_unix_src/FreeBSD/geom_ventoy_src/*/; do
             ver=$(basename "$d")
             (cd "$d" && tar cf - .) | mcopy -i data.raw - "::/ventoy_src_$ver.tar"
           done
-          mdir -i data.raw ::
 
-          # Write build.sh
           cat > build.sh << 'BSHEOF'
-#!/bin/sh
-set -ex
-KVER=$(uname -r)
-VV=$(echo $KVER | cut -d. -f1)x
-echo "Kernel: $KVER  Version: $VV"
-
-# Ensure kernel source exists
-if [ ! -d /usr/src/sys ]; then
-  dhclient vtnet0
-  echo 'nameserver 8.8.8.8' > /etc/resolv.conf
-  R=$(uname -r)
-  fetch "http://download.freebsd.org/releases/amd64/$R/src.txz" -o /tmp/src.txz 2>/dev/null || \
-  fetch "http://download.freebsd.org/snapshots/amd64/$R/src.txz" -o /tmp/src.txz
-  cd / && tar xJf /tmp/src.txz
-fi
-
-# Extract Ventoy source
-cd /tmp
-tar xf /mnt/ventoy_src_$VV.tar
-test -d sys/geom/ventoy || { echo "No source for $VV"; ls /mnt/; exit 1; }
-cp -r sys/geom/ventoy /usr/src/sys/geom/ventoy
-mkdir -p /usr/src/sys/modules/geom/geom_ventoy
-cp sys/modules/geom/geom_ventoy/Makefile /usr/src/sys/modules/geom/geom_ventoy/
-
-# Build
-cd /usr/src/sys/modules/geom/geom_ventoy
-make -j$(sysctl -n hw.ncpu)
-
-# Copy result
-cp geom_ventoy.ko /mnt/
-xz -zf /mnt/geom_ventoy.ko
-echo "BUILD_DONE"
-BSHEOF
+          #!/bin/sh
+          set -ex
+          KVER=$(uname -r)
+          VV=$(echo $KVER | cut -d. -f1)x
+          echo "Kernel: $KVER  Version: $VV"
+          if [ ! -d /usr/src/sys ]; then
+            dhclient vtnet0
+            echo 'nameserver 8.8.8.8' > /etc/resolv.conf
+            R=$(uname -r)
+            fetch "http://download.freebsd.org/releases/amd64/$R/src.txz" -o /tmp/src.txz 2>/dev/null || \
+            fetch "http://download.freebsd.org/snapshots/amd64/$R/src.txz" -o /tmp/src.txz
+            cd / && tar xJf /tmp/src.txz
+          fi
+          cd /tmp && tar xf /mnt/ventoy_src_$VV.tar
+          test -d sys/geom/ventoy || { echo "No source for $VV"; ls /mnt/; exit 1; }
+          cp -r sys/geom/ventoy /usr/src/sys/geom/ventoy
+          mkdir -p /usr/src/sys/modules/geom/geom_ventoy
+          cp sys/modules/geom/geom_ventoy/Makefile /usr/src/sys/modules/geom/geom_ventoy/
+          cd /usr/src/sys/modules/geom/geom_ventoy
+          make -j$(sysctl -n hw.ncpu)
+          cp geom_ventoy.ko /mnt/
+          xz -zf /mnt/geom_ventoy.ko
+          echo "BUILD_DONE"
+          BSHEOF
           mcopy -i data.raw build.sh ::/build.sh
           ls -lh data.raw
 
-      # ───── Build via serial console ─────
-      - name: Build kernel module inside VM (serial console)
+      # Build via serial console (expect)
+      - name: Build kernel module inside VM
         id: build
         run: |
           KVM=",accel=kvm"
           [ ! -e /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ] && KVM=",accel=tcg"
 
           cat > run.exp << 'EXPEOF'
-set timeout 900
-set kvm [lindex $argv 0]
-
-spawn qemu-system-x86_64 -machine pc-q35-4.2$kvm -m 4096 \
-  -drive file=disk.qcow2,format=qcow2,if=virtio \
-  -drive file=data.raw,format=raw,if=virtio \
-  -nic user,model=virtio-net-pci \
-  -nographic -no-reboot
-
-# Boot menu -> single-user
-expect { "Autoboot in" { send " "; exp_continue } "OK" { } timeout { exit 1 } }
-send "boot -s\r"
-expect { "#" { } timeout { exit 1 } }
-
-# Mount root rw and data disk
-send "mount -uw /\r"
-expect "#"
-send "for d in nda1 vtbd1 nvd1 da0; do mount -t msdosfs /dev/\$d /mnt 2>/dev/null && echo DISK=\$d && break; done\r"
-expect "#"
-
-# Build
-send "sh /mnt/build.sh\r"
-expect "BUILD_DONE" { } timeout { exit 1 }
-
-send "sync; poweroff\r"
-expect eof
-EXPEOF
+          set timeout 900
+          set kvm [lindex $argv 0]
+          spawn qemu-system-x86_64 -machine pc-q35-4.2$kvm -m 4096 \
+            -drive file=disk.qcow2,format=qcow2,if=virtio \
+            -drive file=data.raw,format=raw,if=virtio \
+            -nic user,model=virtio-net-pci \
+            -nographic -no-reboot
+          expect { "Autoboot in" { send " "; exp_continue } "OK" { } timeout { exit 1 } }
+          send "boot -s\r"
+          expect { "#" { } timeout { exit 1 } }
+          send "mount -uw /\r"
+          expect "#"
+          send "for d in nda1 vtbd1 nvd1 da0; do mount -t msdosfs /dev/\$d /mnt 2>/dev/null && echo DISK=\$d && break; done\r"
+          expect "#"
+          send "sh /mnt/build.sh\r"
+          expect "BUILD_DONE" { } timeout { exit 1 }
+          send "sync; poweroff\r"
+          expect eof
+          EXPEOF
 
           expect run.exp "$KVM"
           echo "Build exit: $?"
 
-      # ───── Extract artifact ─────
-      - name: Extract .ko from data disk
+      # Extract artifact
+      - name: Extract ko from data disk
         run: |
-          mdir -i data.raw ::/ 2>/dev/null | grep geom_ventoy || true
-          mcopy -i data.raw ::/geom_ventoy.ko.xz . 2>/dev/null || \
-          mcopy -i data.raw ::/geom_ventoy.ko.xz ./geom_ventoy.ko.xz 2>/dev/null || true
+          mcopy -i data.raw ::/geom_ventoy.ko.xz . 2>/dev/null || true
           ls -lh geom_ventoy.ko.xz 2>/dev/null || echo "No .ko found"
 
       - name: Upload KMOD artifact
@@ -225,7 +199,7 @@ EXPEOF
 
   build-ventoy:
     needs: [build-kmod]
-    if: ${{ inputs.build_ventoy == true && !cancelled() && !failure() }}
+    if: ${{ inputs.build_ventoy == true && not(cancelled()) && not(failure()) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
