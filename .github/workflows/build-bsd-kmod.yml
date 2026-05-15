@@ -119,23 +119,20 @@ jobs:
             -nographic -no-reboot 2>&1 | tee install.log || true
           tail -5 install.log
 
-      # ───── Data disk with Ventoy source + build script ─────
+      # ───── Data disk with Ventoy source (tar) + build script ─────
       - name: Create data disk with Ventoy source and build script
         run: |
           dd if=/dev/zero of=data.raw bs=1M count=100
           mkfs.msdos -F 32 data.raw
 
-          # Copy Ventoy source for all versions
-          mmd -i data.raw ::/ventoy_src
+          # Tar each version's source tree preserving directory structure
           for d in Unix/ventoy_unix_src/FreeBSD/geom_ventoy_src/*/; do
             ver=$(basename "$d")
-            mmd -i data.raw "::/ventoy_src/$ver"
-            for f in "$d"sys/geom/ventoy/* "$d"sys/modules/geom/geom_ventoy/Makefile; do
-              [ -f "$f" ] && mcopy -i data.raw "$f" "::/ventoy_src/$ver/"
-            done
+            (cd "$d" && tar cf - .) | mcopy -i data.raw - "::/ventoy_src_$ver.tar"
           done
+          mdir -i data.raw ::
 
-          # Write build.sh (handles everything: source download + build)
+          # Write build.sh
           cat > build.sh << 'BSHEOF'
 #!/bin/sh
 set -ex
@@ -153,13 +150,13 @@ if [ ! -d /usr/src/sys ]; then
   cd / && tar xJf /tmp/src.txz
 fi
 
-# Copy Ventoy source
-cp -r /mnt/ventoy_src /tmp/
-VS=/tmp/ventoy_src/$VV
-test -d $VS || { echo "No source for $VV"; ls /tmp/ventoy_src/; exit 1; }
-cp -r $VS/sys/geom/ventoy /usr/src/sys/geom/ventoy 2>/dev/null || true
+# Extract Ventoy source
+cd /tmp
+tar xf /mnt/ventoy_src_$VV.tar
+test -d sys/geom/ventoy || { echo "No source for $VV"; ls /mnt/; exit 1; }
+cp -r sys/geom/ventoy /usr/src/sys/geom/ventoy
 mkdir -p /usr/src/sys/modules/geom/geom_ventoy
-cp $VS/Makefile /usr/src/sys/modules/geom/geom_ventoy/ 2>/dev/null || true
+cp sys/modules/geom/geom_ventoy/Makefile /usr/src/sys/modules/geom/geom_ventoy/
 
 # Build
 cd /usr/src/sys/modules/geom/geom_ventoy
@@ -171,9 +168,7 @@ xz -zf /mnt/geom_ventoy.ko
 echo "BUILD_DONE"
 BSHEOF
           mcopy -i data.raw build.sh ::/build.sh
-          mdir -i data.raw ::
-          qemu-img convert -f raw -O qcow2 data.raw data.qcow2
-          ls -lh data.qcow2
+          ls -lh data.raw
 
       # ───── Build via serial console ─────
       - name: Build kernel module inside VM (serial console)
@@ -188,7 +183,7 @@ set kvm [lindex $argv 0]
 
 spawn qemu-system-x86_64 -machine pc-q35-4.2$kvm -m 4096 \
   -drive file=disk.qcow2,format=qcow2,if=virtio \
-  -drive file=data.qcow2,format=qcow2,if=virtio \
+  -drive file=data.raw,format=raw,if=virtio \
   -nic user,model=virtio-net-pci \
   -nographic -no-reboot
 
