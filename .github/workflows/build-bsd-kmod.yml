@@ -70,9 +70,16 @@ jobs:
 
       - name: Install FreeBSD from ISO
         run: |
+          # Use KVM if available, otherwise fall back to TCG
+          KVM=",accel=kvm"
+          if [ ! -e /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            KVM=",accel=tcg"
+            echo "KVM not available, using TCG (slower)"
+          fi
+
           echo "Starting automated installation (may take 5-15 min) ..."
           timeout 900 qemu-system-x86_64 \
-            -machine pc-q35-4.2,accel=kvm \
+            -machine pc-q35-4.2${KVM} \
             -m 4096 \
             -cdrom freebsd.iso \
             -drive file=config.iso,format=raw,media=cdrom \
@@ -89,9 +96,16 @@ jobs:
           ssh-keygen -t rsa -f id_rsa -N '' -q
           mkdir -p ~/.ssh
 
+          # Use KVM if available, otherwise fall back to TCG
+          KVM=",accel=kvm"
+          if [ ! -e /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
+            KVM=",accel=tcg"
+            echo "KVM not available, using TCG (slower)"
+          fi
+
           # Start VM from installed disk
           qemu-system-x86_64 \
-            -machine pc-q35-4.2,accel=kvm \
+            -machine pc-q35-4.2${KVM} \
             -m 4096 \
             -drive file=disk.qcow2,format=qcow2,if=virtio \
             -nic user,model=virtio-net-pci,hostfwd=tcp::10022-:22 \
