@@ -95,7 +95,7 @@ jobs:
             -m 4096 \
             -drive file=disk.qcow2,format=qcow2,if=virtio \
             -nic user,model=virtio-net-pci,hostfwd=tcp::10022-:22 \
-            -nographic -no-reboot -pidfile vm.pid -daemonize
+            -no-reboot -pidfile vm.pid -daemonize
 
           echo "Waiting for SSH ..."
           for i in $(seq 1 120); do
