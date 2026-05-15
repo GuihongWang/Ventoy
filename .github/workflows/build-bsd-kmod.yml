@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       freebsd_iso_url:
-        description: 'BSD ISO URL (FreeBSD/pfSense/ClonOS/MidnightBSD etc.)'
+        description: 'BSD ISO URL (for kernel source download path)'
         required: true
         type: string
       freebsd_version:
-        description: 'Optional version override (e.g., 15.x, 14.x, 13.x). Leave empty to auto-detect.'
+        description: 'VM release to boot (e.g., 15.0, 14.1, 13.3). Default: 14.1'
         required: false
         type: string
         default: ''
@@ -26,61 +26,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # ============================================================
-      # Step 1: Determine target FreeBSD version from user input/URL
-      # ============================================================
-      - name: Determine target FreeBSD version
-        id: guess-version
+      - name: Determine VM boot release
+        id: vm-release
         run: |
           if [ -n "${{ inputs.freebsd_version }}" ]; then
-            VV="${{ inputs.freebsd_version }}"
-            SRC_VER=$(echo "$VV" | sed 's/\.x//')
-            echo "ventoy_version=$VV" >> $GITHUB_OUTPUT
-            echo "src_ver=$SRC_VER" >> $GITHUB_OUTPUT
-            echo "Using user-specified version: $VV"
-            exit 0
-          fi
-
-          URL="${{ inputs.freebsd_iso_url }}"
-          echo "ISO URL: $URL"
-
-          # Match any version pattern like X.Y in URL
-          # Handles: 15.0-RELEASE, 16.0-CURRENT, 14.1-STABLE, 13.2-BETA1, etc.
-          V=""
-          if [[ "$URL" =~ ([0-9]+\.[0-9]+)-RELEASE ]]; then
-            V="${BASH_REMATCH[1]}"
-          elif [[ "$URL" =~ ([0-9]+\.[0-9]+)-CURRENT ]]; then
-            V="${BASH_REMATCH[1]}"
-          elif [[ "$URL" =~ ([0-9]+\.[0-9]+)-STABLE ]]; then
-            V="${BASH_REMATCH[1]}"
-          elif [[ "$URL" =~ ([0-9]+\.[0-9]+)-BETA[0-9]* ]]; then
-            V="${BASH_REMATCH[1]}"
-          elif [[ "$URL" =~ ([0-9]+\.[0-9]+)-RC[0-9]* ]]; then
-            V="${BASH_REMATCH[1]}"
-          elif [[ "$URL" =~ /([0-9]+\.[0-9]+)/ ]]; then
-            V="${BASH_REMATCH[1]}"
-          fi
-
-          if [ -n "$V" ]; then
-            MAJOR="${V%%.*}"
-            echo "ventoy_version=${MAJOR}.x" >> $GITHUB_OUTPUT
-            echo "src_ver=$V" >> $GITHUB_OUTPUT
-            echo "Parsed target version: ${MAJOR}.x from URL ($V)"
+            echo "release=${{ inputs.freebsd_version }}" >> $GITHUB_OUTPUT
+            echo "VM boot release: ${{ inputs.freebsd_version }}"
           else
-            echo "ventoy_version=14.x" >> $GITHUB_OUTPUT
-            echo "src_ver=14.1" >> $GITHUB_OUTPUT
-            echo "URL parse failed, defaulting to 14.x"
+            echo "release=14.1" >> $GITHUB_OUTPUT
+            echo "VM boot release: 14.1 (default)"
           fi
 
-      # ============================================================
-      # Step 2: Build in FreeBSD VM
-      # ============================================================
       - name: Build kernel module in FreeBSD VM
         id: build-vm
         uses: vmactions/freebsd-vm@v1
         with:
-          # Try target version first, fallback to 14.1 if not available
-          release: ${{ steps.guess-version.outputs.src_ver }}
+          release: ${{ steps.vm-release.outputs.release }}
           usesh: true
           sync: rsync
           mem: 4096
@@ -90,7 +51,7 @@ jobs:
             REPO_DIR=$(pwd)
 
             # ============================================================
-            # A. Detect the VM's running kernel version
+            # A. Detect BSD version INSIDE the VM (sole source of truth)
             # ============================================================
             echo "========== VM SYSTEM DETECTION =========="
             uname -a
@@ -99,14 +60,22 @@ jobs:
             echo "Kernel release : $KERNEL_VER"
             echo "kern.osreldate: $OSDATE"
 
+            # Map kernel version -> Ventoy source version
             case "$KERNEL_VER" in
-              15.*) VM_VV="15.x"; VM_SRC_VER="15.0" ;;
-              14.*) VM_VV="14.x"; VM_SRC_VER="14.1" ;;
-              13.*) VM_VV="13.x"; VM_SRC_VER="13.3" ;;
-              12.*) VM_VV="12.x"; VM_SRC_VER="12.4" ;;
-              *)    VM_VV="";     VM_SRC_VER="" ;;
+              15.*) VV="15.x"; SRC_VER="${KERNEL_VER%-*}" ;;
+              14.*) VV="14.x"; SRC_VER="${KERNEL_VER%-*}" ;;
+              13.*) VV="13.x"; SRC_VER="${KERNEL_VER%-*}" ;;
+              12.*) VV="12.x"; SRC_VER="${KERNEL_VER%-*}" ;;
+              11.*) VV="11.x"; SRC_VER="${KERNEL_VER%-*}" ;;
+              10.*) VV="10.x"; SRC_VER="${KERNEL_VER%-*}" ;;
+              9.*)  VV="9.x";  SRC_VER="${KERNEL_VER%-*}" ;;
+              *)
+                echo "ERROR: Cannot map kernel '$KERNEL_VER' to Ventoy source"
+                exit 1
+                ;;
             esac
-            echo "VM running version: $VM_VV (src: $VM_SRC_VER)"
+            echo "Detected Ventoy source version: $VV"
+            echo "Source version: $SRC_VER"
 
             # Detect BSD distribution
             DISTRO="FreeBSD"
@@ -118,36 +87,23 @@ jobs:
             echo "Distribution: $DISTRO"
 
             # ============================================================
-            # B. Resolve target Ventoy source version
+            # B. Verify Ventoy source exists for this version
             # ============================================================
-            TARGET_VV="${{ steps.guess-version.outputs.ventoy_version }}"
-            echo "Target version from host: $TARGET_VV"
-
-            # Priority: Target VM detected version (user wanted)
-            if [ -d "$REPO_DIR/Unix/ventoy_unix_src/FreeBSD/geom_ventoy_src/$TARGET_VV" ]; then
-              VV="$TARGET_VV"
-              echo "Using target version: $VV (from URL/user input)"
-            elif [ -n "$VM_VV" ] && [ -d "$REPO_DIR/Unix/ventoy_unix_src/FreeBSD/geom_ventoy_src/$VM_VV" ]; then
-              VV="$VM_VV"
-              echo "Target version unavailable, using VM version: $VV"
-            else
-              echo "ERROR: No Ventoy source found for target=$TARGET_VV or VM=$VM_VV"
+            VENTOY_SRC_DIR="$REPO_DIR/Unix/ventoy_unix_src/FreeBSD/geom_ventoy_src/$VV"
+            if [ ! -d "$VENTOY_SRC_DIR" ]; then
+              echo "ERROR: No Ventoy source for detected version $VV"
               echo "Available:"
               ls "$REPO_DIR/Unix/ventoy_unix_src/FreeBSD/geom_ventoy_src/"
               exit 1
             fi
-            VENTOY_SRC_DIR="$REPO_DIR/Unix/ventoy_unix_src/FreeBSD/geom_ventoy_src/$VV"
             echo "Using Ventoy source: $VENTOY_SRC_DIR"
 
             # ============================================================
-            # C. Download kernel source for the TARGET version
+            # C. Install/Download kernel source
             # ============================================================
-            # Strategy: pkg install src > src.txz download > git fallback
-
             install_src_via_pkg() {
               echo "Trying: pkg install -y src"
               pkg install -y src 2>&1 && return 0
-              # The package might be named differently
               pkg install -y freebsd-source 2>&1 && return 0
               pkg install -y base-source 2>&1 && return 0
               return 1
@@ -166,55 +122,41 @@ jobs:
 
             echo "========== INSTALLING KERNEL SOURCE =========="
 
-            # Method 1: pkg install src (best for matching VM release)
-            NEED_DOWNLOAD=true
-            if [ ! -f /usr/src/sys/sys/param.h ]; then
-              if install_src_via_pkg; then
-                NEED_DOWNLOAD=false
-                echo "Source installed via pkg"
-              fi
+            # Method 1: pkg (most reliable, matches running kernel)
+            if [ -f /usr/src/sys/sys/param.h ]; then
+              echo "Source already present at /usr/src"
+            elif install_src_via_pkg; then
+              echo "Source installed via pkg"
             else
-              NEED_DOWNLOAD=false
-              echo "Source already present"
-            fi
-
-            # Method 2: Download src.txz from various URLs
-            if $NEED_DOWNLOAD; then
+              # Method 2: Download src.txz
               echo "pkg failed, trying to download src.txz..."
 
               SUCCESS=false
 
-              # Try from ISO URL's base directory
+              # From ISO URL's base directory
               ISO_URL="${{ inputs.freebsd_iso_url }}"
               BASE="${ISO_URL%/*}"
               download_src_txz "${BASE}/src.txz" && SUCCESS=true
 
-              # Try official snapshot URL for CURRENT
+              # From official snapshot URLs
               if ! $SUCCESS; then
-                SNAP_VER=$(echo "$TARGET_VV" | sed 's/\.x//')
-                download_src_txz "https://download.freebsd.org/snapshots/ISO-IMAGES/${SNAP_VER}/src.txz" && SUCCESS=true
+                MAJOR="${SRC_VER%%.*}"
+                download_src_txz "https://download.freebsd.org/snapshots/ISO-IMAGES/${MAJOR}/src.txz" && SUCCESS=true
+                download_src_txz "https://download.freebsd.org/snapshots/amd64/${SRC_VER}-CURRENT/src.txz" && SUCCESS=true
               fi
 
-              # Try official release URL
+              # From official release URLs
               if ! $SUCCESS; then
-                for RV in \
-                  "${{ steps.guess-version.outputs.src_ver }}-RELEASE" \
-                  "${VM_SRC_VER}-RELEASE"; do
-                  download_src_txz "https://download.freebsd.org/releases/amd64/${RV}/src.txz" && {
-                    SUCCESS=true
-                    break
-                  }
-                done
+                download_src_txz "https://download.freebsd.org/releases/amd64/${SRC_VER}-RELEASE/src.txz" && SUCCESS=true
+                download_src_txz "https://download.freebsd.org/releases/ISO-IMAGES/${SRC_VER}/src.txz" && SUCCESS=true
               fi
 
               if ! $SUCCESS; then
                 echo "ERROR: All source download methods failed!"
-                echo "Please specify freebsd_version manually, or use a valid ISO URL."
                 exit 1
               fi
             fi
 
-            # Verify source is available
             if [ ! -d /usr/src/sys/geom ]; then
               echo "ERROR: Kernel source not properly installed at /usr/src/sys"
               ls -la /usr/src/ 2>/dev/null || echo "/usr/src empty"
@@ -238,7 +180,7 @@ jobs:
             file geom_ventoy.ko
 
             # ============================================================
-            # E. Install to repo directory (synced back to host)
+            # E. Install to repo (synced back to host)
             # ============================================================
             echo "========== INSTALLING =========="
             TARGET_DIR="$REPO_DIR/Unix/ventoy_unix/FreeBSD/geom_ventoy_ko/$VV/64"
@@ -248,12 +190,9 @@ jobs:
             xz -zf geom_ventoy.ko
             ls -la "$TARGET_DIR/"
 
-            # Save detected version for host-side reading
+            # Save detected version for host
             echo "$VV" > "$REPO_DIR/Unix/.detected_version"
 
-      # ============================================================
-      # Step 3: Read back detected version from synced output
-      # ============================================================
       - name: Read detected version
         id: save-output
         run: |
@@ -262,23 +201,16 @@ jobs:
             echo "ventoy_version=$VV" >> $GITHUB_OUTPUT
             echo "Detected version from VM: $VV"
           else
-            VV="${{ steps.guess-version.outputs.ventoy_version }}"
-            echo "ventoy_version=$VV" >> $GITHUB_OUTPUT
-            echo "Using fallback version: $VV"
+            echo "ventoy_version=14.x" >> $GITHUB_OUTPUT
+            echo "WARNING: .detected_version not found, using 14.x"
           fi
 
-      # ============================================================
-      # Step 4: Upload .ko.xz as artifact
-      # ============================================================
       - name: Upload KMOD artifact
         uses: actions/upload-artifact@v4
         with:
           name: geom_ventoy-${{ steps.save-output.outputs.ventoy_version }}-64.ko.xz
           path: Unix/ventoy_unix/FreeBSD/geom_ventoy_ko/${{ steps.save-output.outputs.ventoy_version }}/64/geom_ventoy.ko.xz
 
-  # ================================================================
-  # Build full Ventoy package (optional)
-  # ================================================================
   build-ventoy:
     needs: [build-kmod]
     if: ${{ inputs.build_ventoy == true && !cancelled() && !failure() }}
