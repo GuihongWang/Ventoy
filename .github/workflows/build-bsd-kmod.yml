@@ -66,12 +66,22 @@ jobs:
           echo 'zfs umount -a 2>/dev/null || true' >> $F
           echo 'poweroff' >> $F
           chmod +x $F
-          # FAT image (FreeBSD installer looks for installerconfig on FAT)
-          dd if=/dev/zero of=config.img bs=1k count=2880
-          mkfs.msdos -F 12 config.img
-          mcopy -i config.img installerconfig ::/
-          mdir -i config.img
-          ls -lh config.img
+
+      - name: Modify ISO with autoinstall config
+        run: |
+          sudo apt-get install -y -qq xorriso
+          # Extract ISO preserving Rock Ridge attributes
+          mkdir -p iso_orig
+          xorriso -osirrox on -indev freebsd.iso -extract / iso_orig/ 2>/dev/null
+          # Inject installerconfig and tell boot loader where to find it
+          cp installerconfig iso_orig/installerconfig
+          echo 'installer_config="/installerconfig"' >> iso_orig/boot/loader.conf
+          # Repack bootable FreeBSD ISO with genisoimage
+          rm -f freebsd_auto.iso
+          genisoimage -R -b boot/cdboot -no-emul-boot -boot-load-size 4 \
+            -c boot.catalog -V "FREEBSD_AUTO" \
+            -o freebsd_auto.iso iso_orig/ 2>&1 | tail -5
+          ls -lh freebsd.iso freebsd_auto.iso
 
       - name: Install FreeBSD from ISO
         run: |
@@ -82,14 +92,10 @@ jobs:
           fi
 
           echo "Starting automated installation (may take 5-15 min) ..."
-          # config.img = FAT with installerconfig, attached as USB so FreeBSD mounts it as msdosfs
           timeout 900 qemu-system-x86_64 \
             -machine pc-q35-4.2${KVM} \
             -m 4096 \
-            -cdrom freebsd.iso \
-            -device qemu-xhci,id=xhci \
-            -drive file=config.img,format=raw,if=none,id=config \
-            -device usb-storage,drive=config \
+            -cdrom freebsd_auto.iso \
             -drive file=disk.qcow2,format=qcow2,if=virtio \
             -nic user,model=virtio-net-pci \
             -nographic -no-reboot 2>&1 | tee install.log || true
