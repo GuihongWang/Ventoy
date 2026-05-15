@@ -3,8 +3,8 @@ name: Build BSD KMOD
 on:
   workflow_dispatch:
     inputs:
-      freebsd_iso_url:
-        description: 'BSD ISO URL'
+      freebsd_image_url:
+        description: 'BSD ISO or VM image URL (.iso / .qcow2 / .qcow2.xz)'
         required: true
         type: string
       build_ventoy:
@@ -24,21 +24,62 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 qemu-utils sshpass mtools dosfstools genisoimage
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils sshpass \
+            mtools dosfstools genisoimage xorriso libguestfs-tools
 
-      - name: Download ISO
+      - name: Download image
+        id: download
         run: |
-          echo "Downloading ISO from: ${{ inputs.freebsd_iso_url }}"
-          curl -fSLo freebsd.iso "${{ inputs.freebsd_iso_url }}"
-          ls -lh freebsd.iso
-          # Extract version string from ISO label
-          ISOLABEL=$(isoinfo -d -i freebsd.iso | grep "Volume id" | awk '{print $3}')
-          echo "ISO label: $ISOLABEL"
+          URL="${{ inputs.freebsd_image_url }}"
+          FILENAME=$(basename "$URL")
+          echo "Downloading from: $URL"
+          curl -fSLo "$FILENAME" "$URL"
+          ls -lh "$FILENAME"
+          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
 
-      - name: Create disk image
-        run: qemu-img create -f qcow2 disk.qcow2 12G
+      - name: Detect and prepare image
+        id: detect
+        run: |
+          FILENAME="${{ steps.download.outputs.filename }}"
 
-      - name: Create automated install config (FAT)
+          # Decompress .xz
+          if [[ "$FILENAME" == *.xz ]]; then
+            echo "=== Decompressing xz ==="
+            xz -d "$FILENAME" && FILENAME="${FILENAME%.xz}"
+            ls -lh "$FILENAME"
+          fi
+
+          FT=$(file "$FILENAME")
+          echo "File type: $FT"
+
+          if [[ "$FILENAME" == *.qcow2 ]] || [[ "$FT" == *"QEMU QCOW"* ]]; then
+            echo "image_type=qcow2" >> $GITHUB_OUTPUT
+            mv "$FILENAME" disk.qcow2
+            echo "Detected QCOW2 VM image — will boot directly"
+          elif [[ "$FILENAME" == *.img ]] || [[ "$FT" == *"DOS/MBR boot sector"* ]]; then
+            echo "image_type=qcow2" >> $GITHUB_OUTPUT
+            qemu-img convert -f raw -O qcow2 "$FILENAME" disk.qcow2
+            rm -f "$FILENAME"
+            echo "Detected raw disk image — converted to QCOW2"
+          elif [[ "$FILENAME" == *.iso ]] || [[ "$FT" == *"ISO 9660"* ]]; then
+            echo "image_type=iso" >> $GITHUB_OUTPUT
+            mv "$FILENAME" freebsd.iso
+            echo "Detected ISO — will install from ISO"
+          else
+            echo "Unknown image type!"
+            exit 1
+          fi
+          ls -lh disk.qcow2 2>/dev/null || true
+
+      - name: Prepare SSH key
+        run: |
+          ssh-keygen -t rsa -f id_rsa -N '' -q
+          mkdir -p ~/.ssh
+          echo "SSH key ready"
+
+      # ───── ISO path ─────
+      - name: Create installerconfig (ISO path)
+        if: steps.detect.outputs.image_type == 'iso'
         run: |
           F=installerconfig
           echo '#!/bin/sh' > $F
@@ -46,93 +87,126 @@ jobs:
           echo 'exec 1>/dev/tty 2>/dev/tty' >> $F
           echo 'ROOTPW=ventoy' >> $F
           echo 'kbdcontrol -L /usr/share/syscons/keymaps/us.kbd' >> $F
-          # Detect main disk (skip cd0, da0=USB config, fd0)
-          echo 'DISK=$(sysctl -n kern.disks | tr " " "\n" | grep -v -e "^cd" -e "^da0$" -e "^fd" | head -1)' >> $F
+          echo 'DISK=$(sysctl -n kern.disks | tr " " "\n" | grep -v -e "^cd" -e "^da" -e "^fd" | head -1)' >> $F
           echo 'echo "Installing to disk: $DISK"' >> $F
           echo 'bsdinstall autopart ZFS $DISK' >> $F
           echo 'bsdinstall mount /mnt' >> $F
           echo 'bsdinstall distfetch /usr/freebsd-dist' >> $F
           echo 'bsdinstall distextract /mnt' >> $F
-          printf '%s\n' 'cat >> /mnt/etc/rc.conf << EOF' >> $F
+          echo 'mkdir -p /mnt/root/.ssh' >> $F
+          echo 'cat > /mnt/root/.ssh/authorized_keys << EOF' >> $F
+          cat id_rsa.pub >> $F
+          echo 'EOF' >> $F
+          echo 'chmod 700 /mnt/root/.ssh' >> $F
+          echo 'chmod 600 /mnt/root/.ssh/authorized_keys' >> $F
+          echo 'cat >> /mnt/etc/rc.conf << EOF2' >> $F
           echo 'hostname="ventoy-builder"' >> $F
           echo 'ifconfig_vtnet0="DHCP"' >> $F
           echo 'sshd_enable="YES"' >> $F
-          echo 'EOF' >> $F
-          printf '%s\n' "sed -i '' 's/^#PermitRootLogin.*/PermitRootLogin yes/' /mnt/etc/ssh/sshd_config" >> $F
+          echo 'EOF2' >> $F
+          echo 'sed -i "" "s/^#PermitRootLogin.*/PermitRootLogin yes/" /mnt/etc/ssh/sshd_config' >> $F
           echo 'echo "$ROOTPW" | pw -R /mnt usermod root -h 0' >> $F
           echo 'cp /usr/share/zoneinfo/UTC /mnt/etc/localtime' >> $F
-          echo 'echo '\''autoboot_delay="0"'\'' >> /mnt/boot/loader.conf' >> $F
+          echo 'echo "autoboot_delay=\"0\"" >> /mnt/boot/loader.conf' >> $F
           echo 'bsdinstall umount /mnt' >> $F
           echo 'zfs umount -a 2>/dev/null || true' >> $F
           echo 'poweroff' >> $F
           chmod +x $F
 
-      - name: Modify ISO with autoinstall config
+      - name: Embed installerconfig into ISO
+        if: steps.detect.outputs.image_type == 'iso'
         run: |
-          sudo apt-get install -y -qq xorriso
-          # Extract ISO preserving Rock Ridge attributes
           mkdir -p iso_orig
           xorriso -osirrox on -indev freebsd.iso -extract / iso_orig/ 2>/dev/null
-          # Inject installerconfig and tell boot loader where to find it
           cp installerconfig iso_orig/installerconfig
           echo 'installer_config="/installerconfig"' >> iso_orig/boot/loader.conf
-          # Repack bootable FreeBSD ISO with genisoimage
           rm -f freebsd_auto.iso
           genisoimage -R -b boot/cdboot -no-emul-boot -boot-load-size 4 \
             -c boot.catalog -V "FREEBSD_AUTO" \
             -o freebsd_auto.iso iso_orig/ 2>&1 | tail -5
-          ls -lh freebsd.iso freebsd_auto.iso
+          ls -lh freebsd_auto.iso
+
+      - name: Create disk (ISO path)
+        if: steps.detect.outputs.image_type == 'iso'
+        run: qemu-img create -f qcow2 disk.qcow2 12G
 
       - name: Install FreeBSD from ISO
+        if: steps.detect.outputs.image_type == 'iso'
         run: |
           KVM=",accel=kvm"
           if [ ! -e /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
             KVM=",accel=tcg"
-            echo "KVM not available, using TCG (slower)"
+            echo "KVM not available, will be slow"
           fi
-
-          echo "Starting automated installation (may take 5-15 min) ..."
+          echo "Installing FreeBSD from ISO (may take 5-15 min) ..."
           timeout 900 qemu-system-x86_64 \
-            -machine pc-q35-4.2${KVM} \
-            -m 4096 \
+            -machine pc-q35-4.2${KVM} -m 4096 \
             -cdrom freebsd_auto.iso \
             -drive file=disk.qcow2,format=qcow2,if=virtio \
             -nic user,model=virtio-net-pci \
             -nographic -no-reboot 2>&1 | tee install.log || true
-          echo "=== Install exit ==="
-          tail -5 install.log
+          tail -10 install.log
+          # Verify disk has data
+          qemu-img info disk.qcow2
 
-      - name: Boot and build kernel module
+      # ───── QCOW2 path ─────
+      - name: Inject SSH key into VM image (QCOW2 path)
+        if: steps.detect.outputs.image_type == 'qcow2'
+        run: |
+          echo "Injecting SSH key into VM image (best-effort)..."
+          {
+            echo 'mkdir-p /root/.ssh'
+            echo "write-append /root/.ssh/authorized_keys \"$(cat id_rsa.pub)\""
+            echo 'chmod 700 /root/.ssh'
+            echo 'chmod 600 /root/.ssh/authorized_keys'
+          } | guestfish -a disk.qcow2 -i 2>/dev/null && \
+            echo "guestfish: SSH key injected" || \
+            echo "guestfish failed (likely ZFS) — will use password auth"
+
+      # ───── Common boot + build ─────
+      - name: Boot VM and build kernel module
         id: build
         run: |
-          # SSH key
-          ssh-keygen -t rsa -f id_rsa -N '' -q
-          mkdir -p ~/.ssh
-
-          # Use KVM if available, otherwise fall back to TCG
           KVM=",accel=kvm"
           if [ ! -e /dev/kvm ] || [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then
             KVM=",accel=tcg"
             echo "KVM not available, using TCG (slower)"
           fi
 
-          # Start VM from installed disk
+          # Boot VM
           qemu-system-x86_64 \
-            -machine pc-q35-4.2${KVM} \
-            -m 4096 \
+            -machine pc-q35-4.2${KVM} -m 4096 \
             -drive file=disk.qcow2,format=qcow2,if=virtio \
             -nic user,model=virtio-net-pci,hostfwd=tcp::10022-:22 \
             -no-reboot -pidfile vm.pid -daemonize
 
+          # Wait for SSH
+          SSH_CMD=""
           echo "Waiting for SSH ..."
-          for i in $(seq 1 120); do
+          for i in $(seq 1 180); do
+            # Try key auth
             if ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
               -i id_rsa root@localhost -p 10022 true 2>/dev/null; then
-              echo "SSH ready after ${i}s"
+              SSH_CMD="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_rsa root@localhost -p 10022"
+              echo "SSH key auth succeeded after ${i}s"
               break
             fi
-            if [ $i -eq 120 ]; then
-              echo "SSH timeout"
+            # Try password auth (freebsd)
+            if sshpass -p "freebsd" ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null root@localhost -p 10022 true 2>/dev/null; then
+              SSH_CMD="sshpass -p freebsd ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@localhost -p 10022"
+              echo "SSH password auth (freebsd) succeeded after ${i}s"
+              break
+            fi
+            # Try empty password
+            if sshpass -p "" ssh -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null root@localhost -p 10022 true 2>/dev/null; then
+              SSH_CMD="sshpass -p '' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@localhost -p 10022"
+              echo "SSH empty password auth succeeded after ${i}s"
+              break
+            fi
+            if [ $i -eq 180 ]; then
+              echo "SSH timeout after 6 min"
               kill $(cat vm.pid) 2>/dev/null || true
               exit 1
             fi
@@ -141,8 +215,7 @@ jobs:
 
           # Detect version
           echo "=== VM system ==="
-          KVER=$(ssh -o StrictHostKeyChecking=no -i id_rsa \
-            root@localhost -p 10022 uname -r)
+          KVER=$($SSH_CMD uname -r)
           echo "Kernel: $KVER"
 
           case "$KVER" in
@@ -158,15 +231,19 @@ jobs:
           echo "ventoy_version=$VV" >> $GITHUB_OUTPUT
 
           # Copy Ventoy source
-          ssh -o StrictHostKeyChecking=no -i id_rsa \
-            root@localhost -p 10022 mkdir -p /ventoy
-          rsync -e "ssh -o StrictHostKeyChecking=no -i id_rsa -p 10022" \
+          $SSH_CMD mkdir -p /ventoy
+          rsync -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i id_rsa -p 10022" \
+            -a --rsync-path=/usr/bin/rsync \
+            Unix/ root@localhost:/ventoy/Unix/ 2>/dev/null || \
+          rsync -e "sshpass -p freebsd ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 10022" \
+            -a --rsync-path=/usr/bin/rsync \
+            Unix/ root@localhost:/ventoy/Unix/ || \
+          rsync -e "sshpass -p '' ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 10022" \
             -a --rsync-path=/usr/bin/rsync \
             Unix/ root@localhost:/ventoy/Unix/
 
           # Install kernel source and build
-          ssh -o StrictHostKeyChecking=no -i id_rsa \
-            root@localhost -p 10022 "
+          $SSH_CMD "
             set -ex
 
             # Install kernel source
@@ -199,14 +276,12 @@ jobs:
 
           # Copy artifact out
           mkdir -p "Unix/ventoy_unix/FreeBSD/geom_ventoy_ko/$VV/64"
-          scp -o StrictHostKeyChecking=no -i id_rsa -P 10022 \
-            root@localhost:/usr/src/sys/modules/geom/geom_ventoy/geom_ventoy.ko.xz \
-            "Unix/ventoy_unix/FreeBSD/geom_ventoy_ko/$VV/64/"
+          $SSH_CMD cat /usr/src/sys/modules/geom/geom_ventoy/geom_ventoy.ko.xz \
+            > "Unix/ventoy_unix/FreeBSD/geom_ventoy_ko/$VV/64/geom_ventoy.ko.xz"
           ls -la "Unix/ventoy_unix/FreeBSD/geom_ventoy_ko/$VV/64/"
 
           # Shutdown
-          ssh -o StrictHostKeyChecking=no -i id_rsa \
-            root@localhost -p 10022 shutdown -p now 2>/dev/null || true
+          $SSH_CMD shutdown -p now 2>/dev/null || true
           sleep 3
           kill $(cat vm.pid) 2>/dev/null || true
 
