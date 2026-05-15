@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       freebsd_version:
-        description: 'VM release to boot (e.g., 15.0, 14.1, 13.3). Default: 14.1'
+        description: 'VM release to boot (e.g., 15.0, 14.1, 13.3). Leave empty for auto-detect.'
         required: false
         type: string
         default: ''
@@ -26,16 +26,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Determine VM boot release
+      - name: Auto-detect latest available FreeBSD VM image
         id: vm-release
         run: |
           if [ -n "${{ inputs.freebsd_version }}" ]; then
             echo "release=${{ inputs.freebsd_version }}" >> $GITHUB_OUTPUT
-            echo "VM boot release: ${{ inputs.freebsd_version }}"
-          else
-            echo "release=14.1" >> $GITHUB_OUTPUT
-            echo "VM boot release: 14.1 (default)"
+            echo "Using user-specified VM release: ${{ inputs.freebsd_version }}"
+            exit 0
           fi
+
+          echo "No version specified, auto-detecting latest FreeBSD VM image ..."
+
+          # Query the vmactions/freebsd-builder releases for available VM images
+          TAG=$(curl -sf https://api.github.com/repos/vmactions/freebsd-builder/releases/latest \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo "v1.0.9")
+          echo "Latest builder tag: $TAG"
+
+          ASSETS=$(curl -sf "https://api.github.com/repos/vmactions/freebsd-builder/releases/tags/$TAG" \
+            | python3 -c "import sys,json; [print(a['name']) for a in json.load(sys.stdin)['assets']]" 2>/dev/null || echo "")
+
+          if [ -z "$ASSETS" ]; then
+            # Fallback: try known releases
+            for R in 15.0 14.1 13.3 13.2; do
+              if curl -sfI "https://github.com/vmactions/freebsd-builder/releases/download/$TAG/freebsd-$R.qcow2.zst" >/dev/null 2>&1; then
+                echo "release=$R" >> $GITHUB_OUTPUT
+                echo "Found VM image via HEAD check: FreeBSD $R"
+                exit 0
+              fi
+            done
+          else
+            for R in 15.0 14.1 13.3; do
+              if echo "$ASSETS" | grep -q "freebsd-$R.qcow2"; then
+                echo "release=$R" >> $GITHUB_OUTPUT
+                echo "Found VM image via API: FreeBSD $R"
+                exit 0
+              fi
+            done
+          fi
+
+          echo "release=14.1" >> $GITHUB_OUTPUT
+          echo "Auto-detect failed, using fallback: 14.1"
 
       - name: Build kernel module in FreeBSD VM
         id: build-vm
@@ -128,7 +158,6 @@ jobs:
             elif install_src_via_pkg; then
               echo "Source installed via pkg"
             else
-              # Method 2: Download src.txz
               echo "pkg failed, trying to download src.txz..."
 
               SUCCESS=false
@@ -142,7 +171,6 @@ jobs:
               if ! $SUCCESS; then
                 MAJOR="${SRC_VER%%.*}"
                 download_src_txz "https://download.freebsd.org/snapshots/ISO-IMAGES/${MAJOR}/src.txz" && SUCCESS=true
-                download_src_txz "https://download.freebsd.org/snapshots/amd64/${SRC_VER}-CURRENT/src.txz" && SUCCESS=true
               fi
 
               # From official release URLs
