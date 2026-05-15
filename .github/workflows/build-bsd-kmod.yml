@@ -182,7 +182,7 @@ jobs:
               -machine pc-q35-4.2${KVM} -m 4096 \
               -drive file=disk.qcow2,format=qcow2,if=virtio \
               -nic user,model=virtio-net-pci,hostfwd=tcp::10022-:22 \
-              -no-reboot -pidfile vm.pid -daemonize
+              -display none -no-reboot -pidfile vm.pid -daemonize
 
             local SSH_CMD=""
             for i in $(seq 1 180); do
@@ -218,8 +218,7 @@ jobs:
             SCRIPT=serial_fix.exp
             rm -f $SCRIPT
             echo 'set timeout 120' > $SCRIPT
-            echo "spawn qemu-system-x86_64 -machine pc-q35-4.2${KVM} -m 4096" >> $SCRIPT
-            echo '  -drive file=disk.qcow2,format=qcow2,if=virtio -nographic -no-reboot' >> $SCRIPT
+            echo "spawn qemu-system-x86_64 -machine pc-q35-4.2${KVM} -m 4096 -drive file=disk.qcow2,format=qcow2,if=virtio -nographic -no-reboot" >> $SCRIPT
             echo 'expect {' >> $SCRIPT
             echo '  "Autoboot in" { send " "; exp_continue }' >> $SCRIPT
             echo '  "OK" { }' >> $SCRIPT
